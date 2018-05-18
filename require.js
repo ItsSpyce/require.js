@@ -15,6 +15,15 @@ require = (function($root) {
 		'(function (exports, module, require, __filename, __dirname) {',
 		'\n})'
 	];
+	
+	function ExtLoader(ext, handler) {
+		this.ext = ext[0] === '.' ? ext : '.' + ext;
+		this.handler = handler;
+	}
+	
+	ExtLoader.prototype.match = function(filename) {
+		return filename.endsWith(this.ext);
+	}
 
 	function Module(id, filename, parent) {
 		this.id = id;
@@ -28,6 +37,15 @@ require = (function($root) {
 	}
 
 	Module._packageCache = Object.create(null);
+	Module._exts = Object.create(null);
+	
+	Module._exts['.js'] = new ExtLoader('.js', function(input) {
+		return input;
+	});
+	
+	Module._exts['.json'] = new ExtLoader('.json', function(input) {
+		return JSON.parse(input);
+	});
 
 	function fs_read(location) {
 		var fIn = new BufferedReader(new InputStreamReader(new FileInputStream(location), "UTF8"));
@@ -41,6 +59,10 @@ require = (function($root) {
 		fIn.close();
 		return string;
 	}	
+	
+	function fs_exists(location) {
+		return new File(location).exists();
+	}
 	
 	function path_absolute(path) {
 		return Path.get(path).toAbsolutePath().toString();
@@ -84,6 +106,25 @@ require = (function($root) {
 	function isRequestRelative(request) {
 		return request[1] === sep || request[0] === sep || request[1] === ':' || request[1] === '.';
 	}
+	
+	function assureExt(requestPath) {
+		if (fs_exists(requestPath)) return requestPath;
+		for (var field in Module._exts) {
+			var loader = Module._exts[field];
+			// at this point, we haven't found the file, so plug in the extensions and see if they exists
+			var realPath = requestPath + loader.ext;
+			if (fs_exists(realPath)) return realPath;
+		}
+		throw new Error('No loader for ' + requestPath + ' exists. To add one, reference require.exts');
+	}
+	
+	function getLoader(filename) {
+		for (var field in Module._exts) {
+			if (filename.endsWith(field)) return Module._exts[field];
+		}
+		
+		return Module._exts['.js'];
+	}
 
 	function resolveEntry(requestPath) {
 		requestPath = path_normalize(requestPath);
@@ -126,15 +167,28 @@ require = (function($root) {
 		if (!file && !isRequestRelative(request)) {
 			// this will happen if the package.json doesn't include a 'main' property
 			file = path_resolve($root, request, 'index.js');
+		} else {
+			file = assureExt(file);
 		}
+		
 		return new Module(request, file, module);
 	}
 	
 	// 2: from the returned Module, compile it and return it.
 	function compileModule(module) {
+		var loader = getLoader(module.filename);
 		var script = fs_read(module.filename);
-		var wrapped = wrap(script);
-		module.fn = eval(wrapped);
+		var compiled = loader.handler(script); // if the file is JSON, then this will return a JSON object
+		if (typeof compiled == 'String') {
+			// if compiled is a string, that means we need to compile and eval
+			var wrapped = wrap(compiled);
+			module.fn = eval(wrapped);
+		} else {
+			// if compiled is an object, then we need to set the function as settings the module's exports
+			module.fn = function() {
+				module.exports = compiled;
+			}
+		}
 	}
 	
 	// 3: from the compiled Module, ensure the safety of the object and cache it.
@@ -175,6 +229,8 @@ require = (function($root) {
 		exportModule(module);
 		return module.exports;
 	}
+    require.exts = Module._exts;
+    require.ExtLoader = ExtLoader;
 
 	return require;
 })('node_modules'); // the root location of the installed modules
