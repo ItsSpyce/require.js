@@ -237,5 +237,3 @@ require = (function($root) {
 
 	return require;
 })('./plugins/Thiq/node_modules'); // the root location of the installed modules
-
-unregisterModules = require.unregisterModules;
