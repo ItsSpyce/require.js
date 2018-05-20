@@ -10,35 +10,32 @@ require = (function($root) {
 
 	var isWin32 = Java.type('java.lang.System').getProperty('os.name').startsWith('Windows');
 	var sep = isWin32 ? '\\' : '/';
-	var mainPackageCache = Object.create(null);
 	var wrapper = [
 		'(function (exports, module, require, __filename, __dirname) {',
 		'\n})'
 	];
+
+	function Exports() {
+		this._isDefault = true;
+	}
 	
 	function ExtLoader(ext, handler) {
 		this.ext = ext[0] === '.' ? ext : '.' + ext;
 		this.handler = handler;
 	}
-	
-	ExtLoader.prototype.match = function(filename) {
-		return filename.endsWith(this.ext);
-	}
 
-	function Module(id, filename, parent) {
+	function Module(id, filename) {
 		this.id = id;
 		this.filename = filename;
-		this.parent = parent;
 		this.fn = new Function();
-		this.children = Object.create(null);
-		this.exports = Object.create(null);
+		this.children = {};
+		this.exports = new Exports();
 		this.isLoaded = false;
-		updateChildren(this, parent);
 	}
 
 	Module._packageCache = Object.create(null);
 	Module._exts = Object.create(null);
-	
+
 	Module._exts['.js'] = new ExtLoader('.js', function(input) {
 		return input;
 	});
@@ -60,10 +57,10 @@ require = (function($root) {
 		return string;
 	}	
 	
-	function fs_exists(location) {
-		return new File(location).exists();
+	function fs_exists(path) {
+		return new File(path).exists();
 	}
-	
+
 	function path_absolute(path) {
 		return Path.get(path).toAbsolutePath().toString();
 	}
@@ -92,19 +89,12 @@ require = (function($root) {
 		return lastPath.toString();
 	}
 
-	function updateChildren(module, parent) {
-		var child = parent && !parent.children[module.id];
-		if (!child) return;
-		parent.children[module.id] = module;
-		module.parent = parent;
-	}
-
 	function wrap(script) {
 		return wrapper[0] + script + wrapper[1];
 	}
 
 	function isRequestRelative(request) {
-		return request[1] === sep || request[0] === sep || request[1] === ':' || request[1] === '.';
+		return request[0] == '.' && (request[1] == sep || request[1] == '.');
 	}
 	
 	function assureExt(requestPath) {
@@ -127,51 +117,52 @@ require = (function($root) {
 	}
 
 	function resolveEntry(requestPath) {
-		requestPath = path_normalize(requestPath);
-		var cache = Module._packageCache[requestPath];
-		if (cache) return cache;
-
 		try {
 			var jsonPath = path_resolve(requestPath, 'package.json');
 			var json = fs_read(jsonPath);
-			return Module._packageCache[requestPath] = JSON.parse(json).main;
+			return JSON.parse(json).main;
 		} catch (ex) {
 			throw new Error('Failed to configure module ' + requestPath + ': ' + ex.message);
 		}
 	}
 
-	function resolveFile(request, module) {
-		request = path_normalize(request);
-		if (!module) throw new Error('Cannot resolve relative file outside of module');
-		if (request.indexOf($root) == -1) throw new Error('File cannot reference file outside of root directory');
-		var dir = path_dirname(path_absolute(module.filename));
+	/**
+	 * Resolves the relative path to execution and the module that called the require.
+	 * @param {String} request 
+	 * @param {Module} caller 
+	 */
+	function resolveFile(request, caller) {
+		if (!caller) caller = { filename: $root };
+		var dir = path_dirname(caller.filename);
 		return path_resolve(dir, request);
 	}
 	
-	function tryFile(request, module) {
-		var entry = '';
+	function tryFile(request, caller) {
 		if (isRequestRelative(request)) {
-			return resolveFile(request, module);
+			return resolveFile(request, caller);
 		} else {
 			return resolveEntry(path_resolve($root, request));
 		}
-		
-		return fs_read(entry);
 	}
 	
 	// 1: from the request, determine what file the request is pointing to and return a Module for it
-	function resolveModule(request, module) {
-		request = path_normalize(request);
-		if (mainPackageCache[request]) return mainPackageCache[request];
-		var file = tryFile(request, module);
-		if (!file && !isRequestRelative(request)) {
+	function resolveModule(request, caller) {
+		var file = tryFile(request, caller);
+		var isRelative = isRequestRelative(request);
+		if (!file && !isRelative) {
 			// this will happen if the package.json doesn't include a 'main' property
 			file = path_resolve($root, request, 'index.js');
 		} else {
-			file = assureExt(file);
+			// if we have a 'main' property in the package
+			if (isRelative) {
+				file = assureExt(file);
+			} else {
+				file = path_resolve($root, request, file);
+			}
 		}
-		
-		return new Module(request, file, module);
+		file = path_normalize(file);
+		if (Module._packageCache[file]) return Module._packageCache[file];
+		return new Module(request, file, isRelative ? caller : undefined);
 	}
 	
 	// 2: from the returned Module, compile it and return it.
@@ -179,7 +170,7 @@ require = (function($root) {
 		var loader = getLoader(module.filename);
 		var script = fs_read(module.filename);
 		var compiled = loader.handler(script); // if the file is JSON, then this will return a JSON object
-		if (typeof compiled == 'String') {
+		if (typeof compiled == 'string') {
 			// if compiled is a string, that means we need to compile and eval
 			var wrapped = wrap(compiled);
 			module.fn = eval(wrapped);
@@ -193,8 +184,7 @@ require = (function($root) {
 	
 	// 3: from the compiled Module, ensure the safety of the object and cache it.
 	function cacheModule(module) {
-		mainPackageCache[module.id] = module;
-		updateChildren(module, module.parent);
+		Module._packageCache[module.filename] = module;
 	}
 	
 	// 4: from the completed Module, run the body function and set the exports
@@ -205,32 +195,47 @@ require = (function($root) {
 			// module
 			module,
 			// require,
-			require,
+			function (request) {
+				return require(request, module)
+			},
 			// __filename
 			module.filename,
 			// __dirname
 			path_dirname(module.filename)
 		];
 		
-		module.fn.apply(null, args);
+		try {
+			module.fn.apply(null, args);
+		} catch (ex) {
+			console.log('\xA7cAn error occured when reading ' + module.filename);
+			console.log(ex.getStackTrace());
+			throw ex;
+		}
+		
 		module.isLoaded = true;
 	}
 	
-	function require(request, parentModule) {
-		if (request[0] == '@') return Java.type(request.substr(1));
-		var module = resolveModule(request, parentModule);
-		if (parentModule && parentModule.children[module.id]) {
-			return parentModule.children[module.id].exports;
-		} else if (mainPackageCache[module.id]) {
-			return mainPackageCache[module.id].exports;
+	function require(request, caller) {
+		if (request[0] == '@') return eval(request.substr(1));
+		if (isWin32) request = request.replace('/', '\\');
+		else request = request.replace('\\', '/');
+		var module = resolveModule(request, caller);
+		if (Module._packageCache[module.filename]) {
+			return Module._packageCache[module.filename].exports;
 		}
 		compileModule(module);
-		cacheModule(module);
 		exportModule(module);
+		cacheModule(module);
 		return module.exports;
 	}
-    require.exts = Module._exts;
-    require.ExtLoader = ExtLoader;
+
+	require.unregisterModules = function() {
+		Module._packageCache = Object.create(null);
+	}
+
+	require.exts = Module._exts;
 
 	return require;
-})('node_modules'); // the root location of the installed modules
+})('./plugins/Thiq/node_modules'); // the root location of the installed modules
+
+unregisterModules = require.unregisterModules;
